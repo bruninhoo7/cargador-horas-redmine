@@ -2,7 +2,7 @@
 cd /d "%~dp0"
 
 echo ============================================
-echo   HM Consulting - Compilador v1.0.2
+echo   HM Consulting - Compilador v1.1.0
 echo ============================================
 echo.
 
@@ -24,6 +24,11 @@ python -m PyInstaller --onefile --windowed ^
     --add-data "icono_acerca.png;." ^
     --add-data "Carga_Horas_-_c_ID_Ticket.xlsx;." ^
     --add-data "Carga_Horas_-_sin_ID_Ticket.xlsx;." ^
+    --add-data "core;core" ^
+    --hidden-import "core.config_storage" ^
+    --hidden-import "core.redmine_api" ^
+    --hidden-import "core.updater" ^
+    --hidden-import "core.ejecutor" ^
     app.py
 if errorlevel 1 ( echo ERROR compilando app. & pause & exit /b 1 )
 echo     OK

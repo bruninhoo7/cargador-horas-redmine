@@ -7,524 +7,56 @@ Requisitos:
     pip install pandas openpyxl requests pillow
 """
 
+import os, sys, threading, json
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
-import json, os, sys, threading, shutil, hashlib, base64, socket
-import openpyxl
+
+# Módulos del proyecto
+from core.config_storage import (
+    get_app_dir, get_data_dir, get_asset,
+    cargar_auth, guardar_auth, hash_pass,
+    cargar_config, guardar_config,
+    cargar_clientes, guardar_clientes,
+    cargar_stats, guardar_stats,
+    encriptar, desencriptar,
+    CONFIG_DEFAULT, CRYPTO_OK,
+    ACTIVIDADES, UBICACIONES, DIAS_SEMANA, TIPOS_HORA,
+    CONFIG_FILE, PASS_FILE, CLIENTES_FILE, STATS_FILE,
+)
+from core.redmine_api import (
+    obtener_proyectos, obtener_id_actividad, obtener_mi_id,
+    crear_issue, cargar_entrada, obtener_titulo_issue,
+    verificar_duplicado_redmine,
+    limpiar, armar_titulo_issue, armar_comentario,
+)
+from core.updater import verificar_actualizacion, descargar_actualizacion
+from core.ejecutor import ejecutar_carga
+from datetime import datetime, timedelta
 
 def verificar_instancia_unica():
     """Retorna el socket si es la primera instancia, None si ya hay una corriendo."""
+    import socket
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-        s.bind(("127.0.0.1", 47291))  # Puerto fijo para la app
+        s.bind(("127.0.0.1", 47291))
         s.listen(1)
-        return s  # Somos la primera instancia
+        return s
     except OSError:
-        return None  # Ya hay una instancia corriendo
-try:
-    from cryptography.fernet import Fernet
-    CRYPTO_OK = True
-except ImportError:
-    CRYPTO_OK = False
-import pandas as pd
-import requests
+        return None
 
 # ============================================================
 #  METADATA
 # ============================================================
 
 APP_NAME    = "Cargador de Horas Redmine"
-APP_VERSION = "1.4.8"
+APP_VERSION = "1.5.0"
 APP_AUTHOR  = "HM Consulting"
 
 # ============================================================
 #  RUTAS
 # ============================================================
 
-def get_app_dir():
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
-
-def get_data_dir():
-    base = os.environ.get("APPDATA", get_app_dir())
-    path = os.path.join(base, "HMConsulting", "CargadorHoras")
-    os.makedirs(path, exist_ok=True)
-    return path
-
-def get_asset(name):
-    """Busca un asset primero en _MEIPASS (exe), luego al lado del script."""
-    if getattr(sys, "frozen", False):
-        # Cuando corre como exe, los assets están en _MEIPASS
-        meipass = getattr(sys, "_MEIPASS", get_app_dir())
-        path = os.path.join(meipass, name)
-        if os.path.exists(path):
-            return path
-    return os.path.join(get_app_dir(), name)
-
-CONFIG_FILE   = os.path.join(get_data_dir(), "config.json")
-PASS_FILE     = os.path.join(get_data_dir(), "auth.json")
-
-def cargar_auth():
-    if os.path.exists(PASS_FILE):
-        try: return json.load(open(PASS_FILE, encoding="utf-8"))
-        except: pass
-    return {"hash": None}
-
-def guardar_auth(auth):
-    json.dump(auth, open(PASS_FILE, "w", encoding="utf-8"), indent=2)
-
-def hash_pass(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def get_machine_key():
-    """Genera una clave basada en el equipo (usuario + hostname)."""
-    machine_id = f"{os.environ.get('USERNAME','user')}@{socket.gethostname()}"
-    raw = hashlib.sha256(machine_id.encode()).digest()
-    return base64.urlsafe_b64encode(raw)
-
-def get_fernet(password=None):
-    """Devuelve un Fernet con clave combinada de contraseña + máquina."""
-    if not CRYPTO_OK:
-        return None
-    machine_raw = hashlib.sha256(
-        f"{os.environ.get('USERNAME','user')}@{socket.gethostname()}".encode()
-    ).digest()
-    if password:
-        pass_raw = hashlib.sha256(password.encode()).digest()
-        combined = bytes(a ^ b for a, b in zip(machine_raw, pass_raw))
-    else:
-        combined = machine_raw
-    key = base64.urlsafe_b64encode(combined)
-    from cryptography.fernet import Fernet
-    return Fernet(key)
-
-def encriptar(texto, password=None):
-    f = get_fernet(password)
-    if not f: return texto
-    return f.encrypt(texto.encode()).decode()
-
-def desencriptar(texto_enc, password=None):
-    f = get_fernet(password)
-    if not f: return texto_enc
-    try:
-        return f.decrypt(texto_enc.encode()).decode()
-    except Exception:
-        return ""  # Clave incorrecta o no encriptado
-CLIENTES_FILE = os.path.join(get_data_dir(), "clientes.json")
-
-# ============================================================
-#  LISTAS DE OPCIONES
-# ============================================================
-
-ACTIVIDADES = [
-    "Soporte", "Análisis", "Configuración", "Desarrollo",
-    "Diseño", "Documentación", "Capacitación", "Migración de Datos",
-    "Pruebas Unitarias", "Pruebas Integrales", "Reunión", "Otra",
-]
-
-UBICACIONES = [
-    "Oficina Rosario", "Oficina BsAs", "Oficina Venado",
-    "Remoto", "On Site",
-]
-
-DIAS_SEMANA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-TIPOS_HORA  = ["Funcional", "SSFF", "ABAP"]
-
-# ============================================================
-#  CONFIG
-# ============================================================
-
-STATS_FILE = os.path.join(get_data_dir(), "stats.json")
-
-def cargar_stats():
-    if os.path.exists(STATS_FILE):
-        try: return json.load(open(STATS_FILE, encoding="utf-8"))
-        except: pass
-    return {"horas_cargadas": 0, "issues_creados": 0, "sesiones": 0}
-
-def guardar_stats(s):
-    json.dump(s, open(STATS_FILE, "w", encoding="utf-8"), indent=2)
-
-CONFIG_DEFAULT = {
-    "redmine_url":      "https://rdm.hmconsulting.com.ar",
-    "api_key":          "",
-    "archivo_excel":    "",
-    "hoja":             "Horas",
-    "actividad":        "Soporte",
-    "tipo_hora":        "Funcional",
-    "ubicacion":        "Oficina Rosario",
-    "ubicacion_remoto": "Remoto",
-    "dia_remoto":       -1,
-    "usa_id_ticket":         True,
-}
-
-def _get_pass_for_crypto():
-    """Obtiene la contraseña actual para encriptar (None si no hay)."""
-    auth = cargar_auth() if os.path.exists(PASS_FILE) else {"hash": None}
-    # No tenemos la contraseña en claro aquí — usamos None (solo clave de máquina)
-    return None
-
-def cargar_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            cfg = CONFIG_DEFAULT.copy()
-            data = json.load(open(CONFIG_FILE, encoding="utf-8"))
-            # Desencriptar API key si está encriptada
-            if data.get("_enc") and CRYPTO_OK:
-                try:
-                    data["api_key"] = desencriptar(data["api_key"])
-                except Exception:
-                    data["api_key"] = ""
-            cfg.update(data)
-            return cfg
-        except Exception:
-            pass
-    return CONFIG_DEFAULT.copy()
-
-def guardar_config(cfg, password=None):
-    data = dict(cfg)
-    if CRYPTO_OK and data.get("api_key"):
-        data["api_key"] = encriptar(data["api_key"], password)
-        data["_enc"] = True
-    else:
-        data.pop("_enc", None)
-    json.dump(data, open(CONFIG_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-
-def cargar_clientes():
-    if os.path.exists(CLIENTES_FILE):
-        try:
-            return json.load(open(CLIENTES_FILE, encoding="utf-8"))
-        except Exception:
-            pass
-    return []
-
-def guardar_clientes(lista):
-    json.dump(lista, open(CLIENTES_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-
-# ============================================================
-#  LÓGICA REDMINE
-# ============================================================
-
-def hdrs(api_key):
-    return {"X-Redmine-API-Key": api_key, "Content-Type": "application/json"}
-
-def obtener_proyectos(url, api_key):
-    """Trae proyectos paginando para obtener todos, solo campos necesarios."""
-    proyectos = []
-    offset = 0
-    limit = 100
-    try:
-        while True:
-            r = requests.get(
-                f"{url}/projects.json?limit={limit}&offset={offset}&status=1",
-                headers=hdrs(api_key))
-            if r.status_code != 200:
-                return None, f"HTTP {r.status_code}"
-            data = r.json()
-            batch = data.get("projects", [])
-            proyectos.extend(batch)
-            total = data.get("total_count", 0)
-            offset += limit
-            if offset >= total or not batch:
-                break
-        return proyectos, None
-    except Exception as e:
-        return None, str(e)
-
-def obtener_id_actividad(url, api_key, nombre):
-    r = requests.get(f"{url}/enumerations/time_entry_activities.json", headers=hdrs(api_key))
-    if r.status_code != 200:
-        return None, f"HTTP {r.status_code}"
-    for a in r.json().get("time_entry_activities", []):
-        if a["name"].lower() == nombre.lower():
-            return a["id"], None
-    return None, f"Actividad '{nombre}' no encontrada"
-
-def obtener_mi_id(url, api_key):
-    r = requests.get(f"{url}/users/current.json", headers=hdrs(api_key))
-    if r.status_code == 200:
-        return r.json()["user"]["id"], None
-    return None, f"HTTP {r.status_code}"
-
-def crear_issue(url, api_key, proyecto_id, titulo, usuario_id):
-    payload = {"issue": {
-        "project_id": proyecto_id, "subject": titulo,
-        "tracker_id": 1, "assigned_to_id": usuario_id,
-    }}
-    r = requests.post(f"{url}/issues.json", headers=hdrs(api_key), data=json.dumps(payload))
-    if r.status_code == 201:
-        return r.json()["issue"]["id"], None
-    return None, r.text
-
-def cargar_entrada(url, api_key, issue_id, fecha, horas, comentario,
-                   act_id, hs_cliente, tipo_hora, ubicacion):
-    entry = {"time_entry": {
-        "issue_id": int(issue_id), "spent_on": fecha,
-        "hours": float(horas), "comments": comentario, "activity_id": act_id,
-        "custom_fields": [
-            {"id": 3, "value": str(hs_cliente)},
-            {"id": 2, "value": tipo_hora},
-            {"id": 4, "value": ubicacion},
-        ]
-    }}
-    r = requests.post(f"{url}/time_entries.json", headers=hdrs(api_key), data=json.dumps(entry))
-    return r.status_code, r.text
-
-def limpiar(val):
-    return "" if pd.isna(val) else str(val).strip()
-
-def armar_titulo_issue(id_ticket, titulo):
-    """Título del issue nuevo = Caso + Titulo."""
-    c = limpiar(id_ticket)
-    t = limpiar(titulo)
-    if c and t: return f"{c} - {t}"
-    return c or t
-
-def armar_comentario(comentario, id_ticket=None, titulo=None):
-    """Comentario de la entrada de tiempo dedicado.
-    Si hay comentario, lo usa. Si no, usa ID_Ticket - Titulo como fallback."""
-    c = limpiar(comentario)
-    if c:
-        return c
-    # Sin comentario: armar ID_Ticket - Titulo
-    t = limpiar(id_ticket)
-    ti = limpiar(titulo)
-    if t and ti: return f"{t} - {ti}"
-    return t or ti
-
-def obtener_titulo_issue(url, api_key, issue_id):
-    """Obtiene el título del issue y lo divide en Caso y Titulo."""
-    try:
-        r = requests.get(f"{url}/issues/{int(issue_id)}.json",
-                         headers=hdrs(api_key))
-        if r.status_code != 200:
-            return None, None
-        subject = r.json().get("issue", {}).get("subject", "")
-        # Dividir por el primer - o # que encuentre
-        for sep in [" - ", " # ", "-", "#"]:
-            if sep in subject:
-                parts = subject.split(sep, 1)
-                return parts[0].strip(), parts[1].strip()
-        # Sin separador: todo va a Titulo
-        return "", subject.strip()
-    except Exception:
-        return None, None
-
-def verificar_duplicado_redmine(url, api_key, issue_id, fecha_str, horas, comentario):
-    """Consulta Redmine para ver si ya existe una entrada idéntica."""
-    try:
-        r = requests.get(
-            f"{url}/time_entries.json",
-            headers=hdrs(api_key),
-            params={"issue_id": issue_id, "limit": 100}
-        )
-        if r.status_code != 200:
-            return False  # Si no podemos verificar, dejamos pasar
-        entries = r.json().get("time_entries", [])
-        for e in entries:
-            if (e.get("spent_on") == fecha_str and
-                abs(float(e.get("hours", 0)) - float(horas)) < 0.01 and
-                e.get("comments", "").strip() == comentario.strip()):
-                return True  # Duplicado encontrado
-        return False
-    except Exception:
-        return False
-
-def ejecutar_carga(cfg, clientes_lista, log, on_done, fecha_desde=None, fecha_hasta=None):
-    def L(m): log(m)
-    try:
-        # Mapeo alias → proyecto_id (case-insensitive, soporta múltiples nombres por coma)
-        mapeo = {}
-        for c in clientes_lista:
-            nombres = c.get("nombres_excel", c.get("nombre_excel", ""))
-            for nombre in [n.strip() for n in nombres.split(",") if n.strip()]:
-                mapeo[nombre.lower()] = c["proyecto_id"]
-
-        # Clientes especiales con issue fijo (sin importar mayúsculas)
-        CLIENTES_ISSUE_FIJO = {
-            "licencia":   7038,
-            "vacaciones": 7038,
-            "vacacion":   7038,
-            "vacas":      7038,
-        }
-        try:
-            df = pd.read_excel(cfg["archivo_excel"], sheet_name=cfg["hoja"])
-        except Exception as e:
-            L(f"❌ No se pudo leer el Excel: {e}"); on_done(False); return
-        total_filas = len(df)
-
-        # Filtrar por rango de fechas si corresponde
-        if fecha_desde and fecha_hasta:
-            df["_fecha_dt"] = pd.to_datetime(df["Fecha"], errors="coerce")
-            df = df[(df["_fecha_dt"] >= fecha_desde) & (df["_fecha_dt"] <= fecha_hasta)]
-            df = df.drop(columns=["_fecha_dt"])
-            L(f"Procesando {len(df)} fila(s) en el rango seleccionado...")
-        else:
-            L(f"Procesando {total_filas} fila(s)...")
-
-        act_id, err = obtener_id_actividad(cfg["redmine_url"], cfg["api_key"], cfg["actividad"])
-        if err: L(f"❌ Error de configuración: {err}"); on_done(False); return
-
-        usr_id, err = obtener_mi_id(cfg["redmine_url"], cfg["api_key"])
-        if err: L(f"❌ Error de autenticación: {err}"); on_done(False); return
-
-        ok = errores = omitidas = duplicados = creados = 0
-        cache = {}              # (proyecto_id, titulo_issue) → id_redmine
-        ids_actualizados        = {}  # idx → nuevo id_redmine
-        id_tickets_actualizados      = {}  # idx → (caso, titulo) obtenidos de Redmine
-        comentarios_actualizados = {}  # idx → comentario auto-generado
-
-        usa_id_ticket = cfg.get("usa_id_ticket", True)
-
-        for idx, row in df.iterrows():
-            fn             = idx + 2
-            id_ticket      = row.get("ID_Ticket") if usa_id_ticket else None
-            titulo_col     = row.get("Titulo")
-            comentario_col = row.get("Comentario")
-            comentario_carga = armar_comentario(comentario_col, id_ticket, titulo_col)
-            # Si el comentario fue auto-generado (estaba vacío), guardarlo para escribir al Excel
-            if not limpiar(comentario_col) and comentario_carga:
-                comentarios_actualizados[idx] = comentario_carga
-            id_redmine = row.get("ID_Redmine")
-            tiene_id   = not (pd.isna(id_redmine) or str(id_redmine).strip() == "")
-
-            # --- ESCENARIO A: Tiene ID → cargar horas y obtener ID_Ticket/Titulo de Redmine ---
-            if tiene_id:
-                id_ticket_actual = limpiar(id_ticket)
-                titulo_actual    = limpiar(titulo_col)
-                if not id_ticket_actual or not titulo_actual:
-                    id_ticket_rd, titulo_rd = obtener_titulo_issue(
-                        cfg["redmine_url"], cfg["api_key"], id_redmine)
-                    if id_ticket_rd is not None or titulo_rd is not None:
-                        val_ticket = id_ticket_rd if not id_ticket_actual else id_ticket_actual
-                        val_titulo = titulo_rd    if not titulo_actual    else titulo_actual
-                        id_tickets_actualizados[idx] = (val_ticket, val_titulo)
-
-
-            # --- ESCENARIO B: Sin ID → crear issue o usar issue fijo ---
-            else:
-                cliente = str(row.get("Cliente", "")).strip()
-                cliente_lower = cliente.lower()
-
-                # Verificar si es un cliente especial con issue fijo
-                if cliente_lower in CLIENTES_ISSUE_FIJO:
-                    id_redmine = CLIENTES_ISSUE_FIJO[cliente_lower]
-                    L(f"  Fila {fn}: Cliente especial '{cliente}' → Issue fijo #{id_redmine}")
-                else:
-                    proyecto_id = mapeo.get(cliente_lower)
-                    if proyecto_id is None:
-                        ident = limpiar(titulo_col) or limpiar(id_ticket) or str(fn)
-                        L(f"❌  Fila {fn} — {ident[:35]}: Cliente '{cliente}' no configurado en la pestaña Clientes")
-                        omitidas += 1; continue
-                    titulo_issue = armar_titulo_issue(id_ticket, titulo_col)
-                    ck = (proyecto_id, titulo_issue)
-                    if ck in cache:
-                        id_redmine = cache[ck]
-                        ids_actualizados[idx] = id_redmine
-                    else:
-                        nid, err = crear_issue(cfg["redmine_url"], cfg["api_key"],
-                                               proyecto_id, titulo_issue, usr_id)
-                        if err:
-                            ident = limpiar(titulo_col) or limpiar(id_ticket) or str(fn)
-                            L(f"❌  Fila {fn} — {ident[:35]}: Error creando issue — {err[:70]}")
-                            errores += 1; continue
-                        cache[ck] = nid
-                        id_redmine = nid
-                        creados += 1
-                        ids_actualizados[idx] = nid
-            # --- Procesar fecha ---
-            fecha_raw = row.get("Fecha")
-            try:
-                fdt = pd.to_datetime(fecha_raw)
-                fecha_str = fdt.strftime("%Y-%m-%d")
-            except Exception:
-                L(f"  Fila {fn}: ❌ Fecha inválida"); errores += 1; continue
-
-            horas = row.get("HS Trabajadas")
-            if pd.isna(horas): horas = 0
-
-            hs_cliente = row.get("HS Cliente", 0)
-            if pd.isna(hs_cliente): hs_cliente = 0
-
-            ubicacion = cfg["ubicacion_remoto"] if (cfg["dia_remoto"] >= 0 and fdt.weekday() == cfg["dia_remoto"]) \
-                        else cfg["ubicacion"]
-
-            # --- Verificar duplicado en Redmine ---
-            es_dup = verificar_duplicado_redmine(
-                cfg["redmine_url"], cfg["api_key"],
-                id_redmine, fecha_str, horas, comentario_carga)
-            if es_dup:
-                duplicados += 1; continue
-
-            # --- Cargar horas ---
-            status, resp = cargar_entrada(
-                cfg["redmine_url"], cfg["api_key"], id_redmine, fecha_str,
-                horas, comentario_carga, act_id, hs_cliente, cfg["tipo_hora"], ubicacion)
-            if status == 201:
-                ok += 1
-            else:
-                titulo_fila = limpiar(titulo_col) or limpiar(id_ticket) or fecha_str
-                # Detectar error específico de issue cerrado
-                if "status" in resp.lower() and ("cerrad" in resp.lower() or "closed" in resp.lower() or "invalid" in resp.lower()):
-                    msg = "Issue cerrado — no se pueden cargar horas. Reabrir el issue en Redmine primero."
-                elif "422" in str(status):
-                    msg = "Datos invalidos (422) — verificar que el issue exista y este abierto."
-                else:
-                    msg = f"HTTP {status} — {resp[:60]}"
-                L(f"❌  Fila {fn} — {fecha_str} — {titulo_fila[:35]}: {msg}")
-                errores += 1
-
-        # --- Actualizar Excel ---
-        if ids_actualizados or id_tickets_actualizados:
-            total_cambios = len(ids_actualizados) + len(id_tickets_actualizados)
-            L(f"\n📝 Actualizando Excel ({total_cambios} cambio(s))...")
-            try:
-                wb = openpyxl.load_workbook(cfg["archivo_excel"])
-                ws = wb[cfg["hoja"]]
-                header_row = [cell.value for cell in ws[1]]
-
-                def col_num(nombre):
-                    try: return header_row.index(nombre) + 1
-                    except ValueError: return None
-
-                col_id    = col_num("ID_Redmine")
-                col_id_ticket  = col_num("ID_Ticket")
-                col_titulo = col_num("Titulo")
-
-                # Escenario B: escribir ID_Redmine nuevo
-                if col_id:
-                    for df_idx, nuevo_id in ids_actualizados.items():
-                        ws.cell(row=df_idx + 2, column=col_id, value=nuevo_id)
-
-                # Escenario A: escribir ID_Ticket y Titulo obtenidos de Redmine
-                for df_idx, (id_ticket_rd, titulo_rd) in id_tickets_actualizados.items():
-                    if col_id_ticket and id_ticket_rd:
-                        ws.cell(row=df_idx + 2, column=col_id_ticket, value=id_ticket_rd)
-                    if col_titulo and titulo_rd:
-                        ws.cell(row=df_idx + 2, column=col_titulo, value=titulo_rd)
-
-
-                # Escenario C: escribir comentario auto-generado
-                col_coment = col_num("Comentario")
-                for df_idx2, coment_gen in comentarios_actualizados.items():
-                    if col_coment:
-                        ws.cell(row=df_idx2 + 2, column=col_coment, value=coment_gen)
-                wb.save(cfg["archivo_excel"])
-            except Exception as e:
-                L(f"❌  Error al actualizar el Excel: {e}")
-
-        L("\n" + "=" * 50)
-        L(f"  ✨ Issues creados   : {creados}")
-        L(f"  ✔ Horas cargadas   : {ok}")
-        L(f"  ⏭ Duplicados omit. : {duplicados}")
-        L(f"  ❌ Con errores      : {errores}")
-        L(f"  ⏭ Omitidas         : {omitidas}")
-        L("=" * 50)
-        on_done(True, ok, creados)
-    except Exception as e:
-        L(f"\n❌ Error inesperado: {e}"); on_done(False, 0, 0)
 
 # ============================================================
 #  COLORES
@@ -639,68 +171,6 @@ class LoginScreen(tk.Tk):
         ttk.Button(top, text="Verificar", command=verificar).pack(pady=4)
 
 
-# ============================================================
-#  AUTO-ACTUALIZACION
-# ============================================================
-GH_USER = "bruninhoo7"
-GH_REPO = "cargador-horas-redmine"
-
-def verificar_actualizacion():
-    import urllib.request, ssl
-    urls = [
-        f"https://api.github.com/repos/{GH_USER}/{GH_REPO}/releases/latest",
-        f"http://api.github.com/repos/{GH_USER}/{GH_REPO}/releases/latest",
-    ]
-    def v2t(v):
-        try: return tuple(int(x) for x in v.split("."))
-        except: return (0,)
-    for url in urls:
-        for timeout in [8, 15, 30]:
-            for ctx in [None, ssl._create_unverified_context()]:
-                try:
-                    req = urllib.request.Request(url)
-                    req.add_header("Accept", "application/vnd.github.v3+json")
-                    req.add_header("User-Agent", "CargadorHorasRedmine")
-                    kwargs = {"timeout": timeout}
-                    if ctx is not None and url.startswith("https"):
-                        kwargs["context"] = ctx
-                    with urllib.request.urlopen(req, **kwargs) as resp:
-                        data = json.loads(resp.read())
-                    latest = data.get("tag_name", "").lstrip("v").strip()
-                    if latest and v2t(latest) > v2t(APP_VERSION):
-                        assets = data.get("assets", [])
-                        url_exe = next((a["browser_download_url"] for a in assets
-                                       if a["name"].endswith(".exe")), None)
-                        if url_exe:
-                            return latest, url_exe
-                    return None, None
-                except Exception:
-                    continue
-    return None, None
-
-
-def descargar_actualizacion(url_asset, dest_path, progress_cb=None):
-    try:
-        import urllib.request
-        req = urllib.request.Request(url_asset)
-        req.add_header("User-Agent", "CargadorHorasRedmine")
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
-            downloaded = 0
-            with open(dest_path, "wb") as f:
-                while True:
-                    chunk = resp.read(8192)
-                    if not chunk: break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if progress_cb and total:
-                        progress_cb(downloaded / total * 100)
-        return True
-    except Exception:
-        return False
-
-    except Exception:
-        return False
 
 # ============================================================
 #  APP
@@ -766,17 +236,6 @@ class App(tk.Tk):
                    command=lambda: (win.clipboard_clear(),
                                     win.clipboard_append(self._debug_box.get("1.0","end")))
                    ).pack(side="left", padx=8)
-
-    def _log_debug(self, msg):
-        """Escribe en el log principal y también en la ventana de debug si está abierta."""
-        self._log(msg)
-        if hasattr(self, "_debug_box") and hasattr(self, "_log_win"):
-            try:
-                if self._log_win.winfo_exists():
-                    self._debug_box.configure(state="normal")
-                    self._debug_box.insert("end", msg + "\n")
-                    self._debug_box.see("end")
-            except: pass
 
     def _check_update(self, manual=False):
         try:
