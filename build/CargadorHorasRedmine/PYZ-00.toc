@@ -1,4 +1,4 @@
-('C:\\HMC_Build\\build\\CargadorHorasRedmine\\PYZ-00.pyz',
+('C:\\Repos\\cargador-horas-redmine\\cargador-horas-redmine\\build\\CargadorHorasRedmine\\PYZ-00.pyz',
  [('PIL',
    'C:\\Users\\bruno\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\PIL\\__init__.py',
    'PYMODULE'),
