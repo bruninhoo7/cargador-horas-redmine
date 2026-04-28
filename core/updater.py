@@ -2,7 +2,7 @@
 Verificación y descarga de actualizaciones desde GitHub Releases.
 """
 import json
-import urllib.request
+import os, urllib.request
 import ssl
 
 GH_USER = "bruninhoo7"
@@ -55,22 +55,37 @@ def verificar_actualizacion(app_version):
 
 
 def descargar_actualizacion(url_asset, dest_path, progress_cb=None):
-    """Descarga el exe de la nueva versión, llamando a progress_cb(porcentaje)."""
-    try:
-        req = urllib.request.Request(url_asset)
-        req.add_header("User-Agent", "CargadorHorasRedmine")
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
-            downloaded = 0
-            with open(dest_path, "wb") as f:
-                while True:
-                    chunk = resp.read(8192)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if progress_cb and total:
-                        progress_cb(downloaded / total * 100)
-        return True
-    except Exception:
-        return False
+    """Descarga el exe de la nueva versión, llamando a progress_cb(porcentaje).
+    Reintenta con SSL desactivado y HTTP si falla."""
+    # Generar URLs alternativas (https con SSL, https sin SSL, http)
+    urls_to_try = [url_asset]
+    if url_asset.startswith("https://"):
+        urls_to_try.append(url_asset.replace("https://", "http://", 1))
+
+    for url in urls_to_try:
+        for ctx in [None, ssl._create_unverified_context()]:
+            try:
+                req = urllib.request.Request(url)
+                req.add_header("User-Agent", "CargadorHorasRedmine")
+                kwargs = {"timeout": 120}
+                if ctx is not None and url.startswith("https"):
+                    kwargs["context"] = ctx
+                with urllib.request.urlopen(req, **kwargs) as resp:
+                    total = int(resp.headers.get("Content-Length", 0))
+                    downloaded = 0
+                    with open(dest_path, "wb") as f:
+                        while True:
+                            chunk = resp.read(8192)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if progress_cb and total:
+                                progress_cb(downloaded / total * 100)
+                # Verificar que se descargo algo significativo
+                if os.path.getsize(dest_path) < 1000:
+                    continue  # Probablemente fallo, intentar siguiente
+                return True
+            except Exception:
+                continue
+    return False

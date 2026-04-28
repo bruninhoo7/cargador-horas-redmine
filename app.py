@@ -50,7 +50,7 @@ def verificar_instancia_unica():
 # ============================================================
 
 APP_NAME    = "Cargador de Horas Redmine"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.3"
 APP_AUTHOR  = "HM Consulting"
 
 # ============================================================
@@ -756,7 +756,119 @@ class App(tk.Tk):
                 self._cli_bind_scroll(self.cli_inner)
         threading.Thread(target=fetch, daemon=True).start()
 
+    def _aplicar_validacion_clientes(self, ruta_excel, clientes_lista):
+        """Escribe una hoja oculta _Clientes con los nombres validos
+        y aplica DataValidation a la columna Cliente de la hoja principal."""
+        if not ruta_excel or not os.path.exists(ruta_excel):
+            return False, "El archivo Excel no existe"
+        try:
+            import openpyxl
+            from openpyxl.worksheet.datavalidation import DataValidation
+            wb = openpyxl.load_workbook(ruta_excel)
+
+            # Reunir todos los nombres validos (case-insensitive ya en la app)
+            nombres = []
+            for c in clientes_lista:
+                for n in c.get("nombres_excel", "").split(","):
+                    n = n.strip()
+                    if n and n not in nombres:
+                        nombres.append(n)
+
+            # Agregar tambien los clientes especiales
+            for esp in ["Licencia", "Vacaciones"]:
+                if esp not in nombres:
+                    nombres.append(esp)
+
+            if not nombres:
+                return False, "No hay clientes para validar"
+
+            # Crear o actualizar la hoja _Clientes
+            sheet_name = "_Clientes"
+            if sheet_name in wb.sheetnames:
+                ws_cli = wb[sheet_name]
+                # Limpiar contenido anterior
+                ws_cli.delete_rows(1, ws_cli.max_row)
+            else:
+                ws_cli = wb.create_sheet(sheet_name)
+
+            # Escribir nombres en columna A
+            for i, nombre in enumerate(nombres, 1):
+                ws_cli.cell(row=i, column=1, value=nombre)
+
+            # Ocultar la hoja
+            ws_cli.sheet_state = "hidden"
+
+            # Aplicar validacion en la hoja principal
+            hoja_principal = self.cfg.get("hoja", "Horas")
+            if hoja_principal not in wb.sheetnames:
+                wb.save(ruta_excel)
+                return False, f"No se encontro la hoja \"{hoja_principal}\""
+
+            ws_main = wb[hoja_principal]
+
+            # Buscar columna Cliente
+            header_row = [cell.value for cell in ws_main[1]]
+            try:
+                col_cliente = header_row.index("Cliente") + 1
+            except ValueError:
+                wb.save(ruta_excel)
+                return False, "No se encontro la columna \"Cliente\""
+
+            from openpyxl.utils import get_column_letter
+            col_letter = get_column_letter(col_cliente)
+
+            # Eliminar validaciones previas en esa columna
+            keep = []
+            for dv in ws_main.data_validations.dataValidation:
+                if not any(col_letter in str(r) for r in dv.sqref.ranges):
+                    keep.append(dv)
+            ws_main.data_validations.dataValidation = keep
+
+            # Crear nueva validacion
+            rango_lista = "$A$1:$A$" + str(len(nombres))
+            formula = "=" + sheet_name + "!" + rango_lista
+            dv = DataValidation(type="list", formula1=formula, allow_blank=True)
+            dv.error = "Cliente no valido. Usa uno de la lista."
+            dv.errorTitle = "Cliente invalido"
+            dv.prompt = "Seleccionar de la lista"
+            dv.promptTitle = "Cliente"
+            dv.showErrorMessage = False  # No bloquear, solo sugerir
+            ws_main.add_data_validation(dv)
+
+            # Aplicar al rango de la columna (filas 2 a 1000)
+            dv.add(col_letter + "2:" + col_letter + "1000")
+
+            wb.save(ruta_excel)
+            return True, f"Validacion aplicada a {len(nombres)} cliente(s)"
+        except Exception as e:
+            return False, str(e)
+
+    def _excel_esta_abierto(self, ruta):
+        """Detecta si el archivo Excel esta abierto/bloqueado por otro proceso."""
+        if not ruta or not os.path.exists(ruta):
+            return False
+        try:
+            # Intentar abrir en modo append (requiere acceso exclusivo)
+            with open(ruta, "a"):
+                pass
+            return False
+        except (PermissionError, OSError):
+            return True
+
+    def _aviso_excel_abierto(self, ruta):
+        """Muestra un mensaje claro indicando que el Excel debe cerrarse."""
+        nombre = os.path.basename(ruta) if ruta else "el archivo Excel"
+        messagebox.showwarning(
+            "Excel abierto",
+            "El archivo \"" + nombre + "\" esta abierto en Excel.\n\n"
+            "Cerralo y volve a intentar la operacion.")
+
     def _guardar_clientes(self):
+        # Verificar que el Excel no este abierto (en caso futuro de aplicar validacion)
+        ruta = self.cfg.get("archivo_excel", "")
+        if ruta and self._excel_esta_abierto(ruta):
+            self._aviso_excel_abierto(ruta)
+            return
         res = []
         for vc, vars_nombre, p in self._cli_rows:
             if vc.get():
@@ -770,7 +882,18 @@ class App(tk.Tk):
         self.clientes = res
         guardar_clientes(res)
         total = sum(len(c["nombres_excel"].split(",")) for c in res)
-        messagebox.showinfo("Guardado", f"✔ {len(res)} proyecto(s), {total} nombre(s) guardados.")
+
+        # Aplicar validacion de datos al Excel si esta configurado
+        msg_validacion = ""
+        if ruta and os.path.exists(ruta) and res:
+            ok_val, info = self._aplicar_validacion_clientes(ruta, res)
+            if ok_val:
+                msg_validacion = "\n\n✔ Lista desplegable aplicada al Excel."
+            else:
+                msg_validacion = f"\n\n⚠ No se pudo aplicar al Excel: {info}"
+
+        messagebox.showinfo("Guardado",
+            f"✔ {len(res)} proyecto(s), {total} nombre(s) guardados." + msg_validacion)
 
     # --- TAB EJECUTAR ---
     def _tab_ejecutar(self, nb):
@@ -1044,6 +1167,11 @@ class App(tk.Tk):
             messagebox.showwarning("Falta configuración","Seleccioná el Excel."); return
         if not self.clientes:
             messagebox.showwarning("Sin clientes","Configurá clientes en la pestaña Clientes."); return
+        # Verificar que el Excel no este abierto
+        ruta_excel = self.cfg.get("archivo_excel", "")
+        if self._excel_esta_abierto(ruta_excel):
+            self._aviso_excel_abierto(ruta_excel)
+            return
         # Validar fechas si corresponde
         fecha_desde = fecha_hasta = None
         if self.v_modo.get() == "fechas":
@@ -1295,10 +1423,10 @@ class App(tk.Tk):
 
         subtit("Excel CON columna ID_Ticket")
         parrafo("Ideal para equipos con ticketeras externas (ServiceNow, JIRA, SAP, etc.) donde los incidentes tienen un numero de ticket propio.")
-        parrafo("El ticket INC0012345 genera en Redmine el incidente: INC0012345 - Descripcion del problema. Esto permite trazabilidad entre el ticket del cliente y Redmine.")
+        parrafo("El titulo del incidente en Redmine se conforma como: ID_Ticket - Titulo. Por ejemplo, si tu ticket externo es INC0012345 y el titulo es Descripcion del problema, el incidente en Redmine se llama: INC0012345 - Descripcion del problema. Esto permite trazabilidad entre el ticket del cliente y Redmine.")
 
         subtit("Excel SIN columna ID_Ticket")
-        parrafo("Ideal para equipos sin ticketera externa. El incidente se arma directamente con el Titulo que escribas, sin numero adicional.")
+        parrafo("Ideal para equipos sin ticketera externa. El titulo del incidente en Redmine se arma directamente con el Titulo que escribas, sin numero adicional adelante.")
 
         subtit("Cuando usar cada uno:")
         box("Con ID_Ticket",
