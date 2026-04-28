@@ -50,7 +50,7 @@ def verificar_instancia_unica():
 # ============================================================
 
 APP_NAME    = "Cargador de Horas Redmine"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 APP_AUTHOR  = "HM Consulting"
 
 # ============================================================
@@ -84,9 +84,22 @@ class LoginScreen(tk.Tk):
             except: pass
         self._build()
         self._center()
-        # Chequeo automático con delay y reintento
-        def _auto_check():
-            threading.Thread(target=self._check_update, daemon=True).start()
+        # Chequeo automático con delay y reintento (intentos crecientes)
+        def _auto_check(intento=1):
+            def worker():
+                try:
+                    nueva_ver, url_exe = verificar_actualizacion(APP_VERSION)
+                    if nueva_ver:
+                        self.after(0, lambda: self._mostrar_update(nueva_ver, url_exe))
+                    elif intento < 3:
+                        # Reintento en 30s y luego en 60s
+                        delay = 30000 if intento == 1 else 60000
+                        self.after(delay, lambda: _auto_check(intento + 1))
+                except Exception:
+                    if intento < 3:
+                        delay = 30000 if intento == 1 else 60000
+                        self.after(delay, lambda: _auto_check(intento + 1))
+            threading.Thread(target=worker, daemon=True).start()
         self.after(3000, _auto_check)
 
     def _center(self):
@@ -239,7 +252,7 @@ class App(tk.Tk):
 
     def _check_update(self, manual=False):
         try:
-            nueva_ver, url_exe = verificar_actualizacion()
+            nueva_ver, url_exe = verificar_actualizacion(APP_VERSION)
             if nueva_ver:
                 self.after(0, lambda: self._mostrar_update(nueva_ver, url_exe))
             elif manual:
